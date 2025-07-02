@@ -15,7 +15,8 @@ type Event string
 
 // Context 是一个泛型类型，用于存储自动机的上下文数据
 type Context[T any] struct {
-	Data T
+	Data  T
+	Error error
 }
 
 // TransitionFunc 是状态转换函数的签名
@@ -160,34 +161,30 @@ func (sm *StateMachine[T]) AddState(state State) *StateMachine[T] {
 }
 
 // requireState 确保状态存在，如果不存在则根据配置决定是返回错误还是添加
-func (sm *StateMachine[T]) requireState(state State, operation string) error {
-	sm.mu.RLock()
+func (sm *StateMachine[T]) requireState(state State, operation string) {
 	_, exists := sm.states[state]
-	sm.mu.RUnlock()
-
 	if !exists {
 		if sm.implicitStateCreation {
-			sm.mu.Lock()
 			sm.states[state] = struct{}{}
-			sm.mu.Unlock()
 			sm.logger.Info("隐式创建状态", "state", state, "operation", operation)
-			return nil
+		} else {
+			sm.ctx.Error = fmt.Errorf("%w: %s: 状态 %s 不存在", ErrStateNotFound, operation, state)
 		}
-		return fmt.Errorf("%w: %s: 状态 %s 不存在", ErrStateNotFound, operation, state)
 	}
-	return nil
 }
 
 // AddTransition 添加一个状态转换规则
-func (sm *StateMachine[T]) AddTransition(from, to State, event Event, condition ConditionFunc[T]) (*StateMachine[T], error) {
+func (sm *StateMachine[T]) AddTransition(from, to State, event Event, condition ConditionFunc[T]) *StateMachine[T] {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	if err := sm.requireState(from, "添加转换"); err != nil {
-		return nil, err
+	sm.requireState(from, "添加转换")
+	if sm.ctx.Error != nil {
+		return sm
 	}
-	if err := sm.requireState(to, "添加转换"); err != nil {
-		return nil, err
+	sm.requireState(to, "添加转换")
+	if sm.ctx.Error != nil {
+		return sm
 	}
 
 	// 初始化事件转换映射
@@ -201,19 +198,21 @@ func (sm *StateMachine[T]) AddTransition(from, to State, event Event, condition 
 	})
 
 	sm.logger.Info("添加状态转换", "from", from, "to", to, "event", event)
-	return sm, nil
+	return sm
 }
 
 // AddTransitionWithCallback 添加一个带回调的状态转换规则
-func (sm *StateMachine[T]) AddTransitionWithCallback(from, to State, event Event, condition ConditionFunc[T], callback TransitionFunc[T]) (*StateMachine[T], error) {
+func (sm *StateMachine[T]) AddTransitionWithCallback(from, to State, event Event, condition ConditionFunc[T], callback TransitionFunc[T]) *StateMachine[T] {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	if err := sm.requireState(from, "添加带回调转换"); err != nil {
-		return nil, err
+	sm.requireState(from, "添加带回调转换")
+	if sm.ctx.Error != nil {
+		return sm
 	}
-	if err := sm.requireState(to, "添加带回调转换"); err != nil {
-		return nil, err
+	sm.requireState(to, "添加带回调转换")
+	if sm.ctx.Error != nil {
+		return sm
 	}
 
 	// 初始化事件转换映射
@@ -228,26 +227,27 @@ func (sm *StateMachine[T]) AddTransitionWithCallback(from, to State, event Event
 	})
 
 	sm.logger.Info("添加带回调状态转换", "from", from, "to", to, "event", event)
-	return sm, nil
+	return sm
 }
 
 // AddSimpleTransition 添加无条件的状态转换规则
-func (sm *StateMachine[T]) AddSimpleTransition(from, to State, event Event) (*StateMachine[T], error) {
+func (sm *StateMachine[T]) AddSimpleTransition(from, to State, event Event) *StateMachine[T] {
 	return sm.AddTransition(from, to, event, nil)
 }
 
 // AddSimpleTransitionWithCallback 添加无条件且带回调的状态转换规则
-func (sm *StateMachine[T]) AddSimpleTransitionWithCallback(from, to State, event Event, callback TransitionFunc[T]) (*StateMachine[T], error) {
+func (sm *StateMachine[T]) AddSimpleTransitionWithCallback(from, to State, event Event, callback TransitionFunc[T]) *StateMachine[T] {
 	return sm.AddTransitionWithCallback(from, to, event, nil, callback)
 }
 
 // OnEvent 注册一个事件回调函数
-func (sm *StateMachine[T]) OnEvent(state State, event Event, callback TransitionFunc[T]) (*StateMachine[T], error) {
+func (sm *StateMachine[T]) OnEvent(state State, event Event, callback TransitionFunc[T]) *StateMachine[T] {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	if err := sm.requireState(state, "注册事件回调"); err != nil {
-		return nil, err
+	sm.requireState(state, "注册事件回调")
+	if sm.ctx.Error != nil {
+		return sm
 	}
 
 	// 初始化事件回调映射
@@ -257,35 +257,37 @@ func (sm *StateMachine[T]) OnEvent(state State, event Event, callback Transition
 
 	sm.callbacks[state][event] = callback
 	sm.logger.Info("注册事件回调", "state", state, "event", event)
-	return sm, nil
+	return sm
 }
 
 // OnEnterState 注册一个状态进入回调函数
-func (sm *StateMachine[T]) OnEnterState(state State, callback TransitionFunc[T]) (*StateMachine[T], error) {
+func (sm *StateMachine[T]) OnEnterState(state State, callback TransitionFunc[T]) *StateMachine[T] {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	if err := sm.requireState(state, "注册进入状态回调"); err != nil {
-		return nil, err
+	sm.requireState(state, "注册进入状态回调")
+	if sm.ctx.Error != nil {
+		return sm
 	}
 
 	sm.onEnterState[state] = callback
 	sm.logger.Info("注册进入状态回调", "state", state)
-	return sm, nil
+	return sm
 }
 
 // OnExitState 注册一个状态退出回调函数
-func (sm *StateMachine[T]) OnExitState(state State, callback TransitionFunc[T]) (*StateMachine[T], error) {
+func (sm *StateMachine[T]) OnExitState(state State, callback TransitionFunc[T]) *StateMachine[T] {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	if err := sm.requireState(state, "注册退出状态回调"); err != nil {
-		return nil, err
+	sm.requireState(state, "注册退出状态回调")
+	if sm.ctx.Error != nil {
+		return sm
 	}
 
 	sm.onExitState[state] = callback
 	sm.logger.Info("注册退出状态回调", "state", state)
-	return sm, nil
+	return sm
 }
 
 // OnStateChange 注册状态变更回调
@@ -308,280 +310,4 @@ func (sm *StateMachine[T]) BeforeAnyEvent(callback TransitionFunc[T]) *StateMach
 func (sm *StateMachine[T]) AfterAnyEvent(callback TransitionFunc[T]) *StateMachine[T] {
 	sm.globals.afterEvent = callback
 	return sm
-}
-
-// BeforeAnyTransition 注册一个在所有状态转换前执行的全局回调
-func (sm *StateMachine[T]) BeforeAnyTransition(callback TransitionFunc[T]) *StateMachine[T] {
-	sm.globals.beforeTransition = callback
-	return sm
-}
-
-// AfterAnyTransition 注册一个在所有状态转换后执行的全局回调
-func (sm *StateMachine[T]) AfterAnyTransition(callback TransitionFunc[T]) *StateMachine[T] {
-	sm.globals.afterTransition = callback
-	return sm
-}
-
-// OnShutdown 注册一个在状态机停止时执行的回调
-func (sm *StateMachine[T]) OnShutdown(callback TransitionFunc[T]) *StateMachine[T] {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
-	sm.shutdownCallbacks = append(sm.shutdownCallbacks, callback)
-	sm.logger.Info("注册关闭回调")
-	return sm
-}
-
-// SetContext 设置自动机的上下文数据
-func (sm *StateMachine[T]) SetContext(data T) *StateMachine[T] {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
-	sm.ctx.Data = data
-	sm.logger.Info("设置上下文数据")
-	return sm
-}
-
-// GetContext 获取自动机的上下文数据
-func (sm *StateMachine[T]) GetContext() *Context[T] {
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
-
-	return sm.ctx
-}
-
-// CurrentState 返回自动机的当前状态
-func (sm *StateMachine[T]) CurrentState() State {
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
-
-	return sm.currentState
-}
-
-// IsRunning 返回状态机是否正在运行
-func (sm *StateMachine[T]) IsRunning() bool {
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
-
-	return sm.running
-}
-
-// SendEvent 向自动机发送一个事件，触发状态转换
-func (sm *StateMachine[T]) SendEvent(event Event) error {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
-	// 确保 afterAnyEvent 始终执行
-	defer func() {
-		if sm.globals.afterEvent != nil {
-			if err := sm.globals.afterEvent(sm.ctx); err != nil {
-				sm.logger.Warn("全局事件后回调出错", "error", err)
-			}
-		}
-	}()
-
-	sm.logger.Info("收到事件", "event", event, "current_state", sm.currentState)
-
-	// 执行全局事件前回调
-	if sm.globals.beforeEvent != nil {
-		if err := sm.globals.beforeEvent(sm.ctx); err != nil {
-			return fmt.Errorf("全局事件前回调出错: %w", err)
-		}
-	}
-
-	// 查找匹配的转换规则
-	transition, err := sm.findMatchingTransition(event)
-	if err != nil {
-		return err
-	}
-
-	// 执行状态转换
-	if err := sm.executeTransition(transition, event); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// findMatchingTransition 查找匹配的转换规则
-func (sm *StateMachine[T]) findMatchingTransition(event Event) (*transition[T], error) {
-	currentTransitions, exists := sm.transitions[sm.currentState]
-	if !exists {
-		return nil, fmt.Errorf("%w: 状态 %s 无事件 %s 的转换", ErrEventNoTransition, sm.currentState, event)
-	}
-
-	// 查找匹配的转换规则
-	transitions, ok := currentTransitions[event]
-	if !ok {
-		return nil, fmt.Errorf("%w: 状态 %s 无事件 %s 的转换", ErrEventNoTransition, sm.currentState, event)
-	}
-
-	// 查找第一个满足条件的转换
-	var matchedTransition *transition[T]
-	for _, t := range transitions {
-		if t.condition == nil || t.condition(sm.ctx) {
-			matchedTransition = &t
-			break
-		}
-	}
-
-	if matchedTransition == nil {
-		return nil, fmt.Errorf("状态 %s 没有满足条件的事件 %s 的转换", sm.currentState, event)
-	}
-
-	return matchedTransition, nil
-}
-
-// executeTransition 执行状态转换
-func (sm *StateMachine[T]) executeTransition(t *transition[T], event Event) error {
-	oldState := sm.currentState
-	sm.logger.Info("开始状态转换", "from", oldState, "to", t.to, "event", event)
-
-	// 执行全局转换前回调
-	if sm.globals.beforeTransition != nil {
-		if err := sm.globals.beforeTransition(sm.ctx); err != nil {
-			return fmt.Errorf("全局转换前回调出错: %w", err)
-		}
-	}
-
-	// 执行事件回调（优先使用转换中定义的回调）
-	var eventCallback TransitionFunc[T]
-	if t.callback != nil {
-		eventCallback = t.callback
-	} else if ec, exists := sm.callbacks[oldState][event]; exists {
-		eventCallback = ec
-	}
-
-	if eventCallback != nil {
-		if err := eventCallback(sm.ctx); err != nil {
-			return fmt.Errorf("处理事件 %s 时出错: %w", event, err)
-		}
-	}
-
-	// 执行状态退出回调
-	if exitCallback, exists := sm.onExitState[oldState]; exists {
-		if err := exitCallback(sm.ctx); err != nil {
-			return fmt.Errorf("退出状态 %s 时出错: %w", oldState, err)
-		}
-	}
-
-	// 执行状态进入回调
-	if enterCallback, exists := sm.onEnterState[t.to]; exists {
-		if err := enterCallback(sm.ctx); err != nil {
-			return fmt.Errorf("进入状态 %s 时出错: %w", t.to, err)
-		}
-	}
-
-	// 转换到新状态
-	sm.currentState = t.to
-
-	// 执行全局转换后回调
-	if sm.globals.afterTransition != nil {
-		if err := sm.globals.afterTransition(sm.ctx); err != nil {
-			return fmt.Errorf("全局转换后回调出错: %w", err)
-		}
-	}
-
-	// 触发所有状态变更回调
-	for _, cb := range sm.onStateChange {
-		cb(oldState, t.to, event, sm.ctx)
-	}
-
-	sm.logger.Info("状态转换完成", "from", oldState, "to", sm.currentState, "event", event)
-	return nil
-}
-
-// StartAutoRun 启动自动运行模式，持续发送事件直到满足退出条件
-func (sm *StateMachine[T]) StartAutoRun(eventGenerator func() (Event, bool)) error {
-	sm.mu.Lock()
-	if sm.running {
-		sm.mu.Unlock()
-		return ErrStateMachineRunning
-	}
-	sm.running = true
-	sm.mu.Unlock()
-
-	defer func() {
-		sm.mu.Lock()
-		sm.running = false
-		sm.mu.Unlock()
-
-		// 执行所有关闭回调
-		for _, callback := range sm.shutdownCallbacks {
-			if err := callback(sm.ctx); err != nil {
-				sm.logger.Warn("关闭回调出错", "error", err)
-			}
-		}
-		sm.logger.Info("状态机已停止")
-	}()
-
-	sm.logger.Info("状态机自动运行模式已启动")
-
-	for {
-		// 生成下一个事件
-		event, continueRunning := eventGenerator()
-		if !continueRunning {
-			break
-		}
-
-		// 发送事件
-		if err := sm.SendEvent(event); err != nil {
-			sm.logger.Error("自动运行时处理事件出错", "event", event, "error", err)
-			return err
-		}
-	}
-
-	return nil
-}
-
-// Validate 验证自动机的配置是否有效
-func (sm *StateMachine[T]) Validate() error {
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
-
-	// 检查初始状态是否存在
-	if _, exists := sm.states[sm.currentState]; !exists {
-		return fmt.Errorf("初始状态 %s 不存在", sm.currentState)
-	}
-
-	// 检查所有转换的目标状态是否存在
-	for fromState, events := range sm.transitions {
-		for event, transitions := range events {
-			for _, t := range transitions {
-				if _, exists := sm.states[t.to]; !exists {
-					return fmt.Errorf("状态 %s 的事件 %s 转换到不存在的状态 %s", fromState, event, t.to)
-				}
-			}
-		}
-	}
-
-	// 检查所有回调的状态是否存在
-	for state := range sm.callbacks {
-		if _, exists := sm.states[state]; !exists {
-			return fmt.Errorf("回调注册到不存在的状态 %s", state)
-		}
-	}
-
-	// 检查所有进入状态回调的状态是否存在
-	for state := range sm.onEnterState {
-		if _, exists := sm.states[state]; !exists {
-			return fmt.Errorf("进入状态回调注册到不存在的状态 %s", state)
-		}
-	}
-
-	// 检查所有退出状态回调的状态是否存在
-	for state := range sm.onExitState {
-		if _, exists := sm.states[state]; !exists {
-			return fmt.Errorf("退出状态回调注册到不存在的状态 %s", state)
-		}
-	}
-
-	return nil
-}
-
-// MustValidate 验证自动机配置，如果无效则panic
-func (sm *StateMachine[T]) MustValidate() {
-	if err := sm.Validate(); err != nil {
-		panic(fmt.Sprintf("自动机配置无效: %v", err))
-	}
 }
