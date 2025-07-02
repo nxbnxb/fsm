@@ -153,7 +153,7 @@ func TestGlobalCallbacks(t *testing.T) {
 	var beforeEventCalled, afterEventCalled bool
 	var beforeTransitionCalled, afterTransitionCalled bool
 
-	fsm := fsm.NewStateMachine[TestContext](StateInitial,
+	fsm := fsm.NewStateMachine(StateInitial,
 		fsm.WithGlobalBeforeEvent(func(ctx *fsm.Context[TestContext]) error {
 			beforeEventCalled = true
 			return nil
@@ -294,7 +294,7 @@ func TestValidation(t *testing.T) {
 	}
 
 	// 无效配置（初始状态不存在）
-	fsmInvalid := fsm.NewStateMachine[TestContext](StateInitial, fsm.WithImplicitStateCreation[TestContext](false))
+	fsmInvalid := fsm.NewStateMachine(StateInitial, fsm.WithImplicitStateCreation[TestContext](false))
 	if err := fsmInvalid.Validate(); !errors.Is(err, fsm.ErrStateNotFound) {
 		t.Fatalf("期望初始状态不存在错误，实际得到: %v", err)
 	}
@@ -321,7 +321,7 @@ func TestErrorHandling(t *testing.T) {
 
 	// 添加转换但不添加目标状态（禁用隐式创建）
 	fsmNoImplicit := fsm.NewStateMachine(StateInitial, fsm.WithImplicitStateCreation[TestContext](false))
-	fsmNoImplicit, err = fsmNoImplicit.AddSimpleTransition(StateInitial, StatePending, EventStart)
+	fsmNoImplicit = fsmNoImplicit.AddSimpleTransition(StateInitial, StatePending, EventStart)
 	if !errors.Is(err, fsm.ErrStateNotFound) {
 		t.Fatalf("期望状态不存在错误，实际得到: %v", err)
 	}
@@ -406,9 +406,7 @@ func TestMultipleEventPaths(t *testing.T) {
 		func(ctx *fsm.Context[TestContext]) bool {
 			return ctx.Data.Counter < 10
 		},
-	)
-
-	machine.AddTransition(
+	).AddTransition(
 		StateInitial,
 		StateFailed,
 		EventStart,
