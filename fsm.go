@@ -1,181 +1,587 @@
 package fsm
 
-
-// generate for doubao
 import (
-    "container/list"
-    "fmt"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sync"
 )
+
+// State 表示自动机的状态类型
+type State string
 
 // Event 表示触发状态转换的事件类型
 type Event string
 
-// State 表示状态机的状态类型
-type State string
-
-// Transition 表示状态转换规则
-type Transition[S comparable, E comparable] struct {
-    From  S
-    Event E
-    To    S
+// Context 是一个泛型类型，用于存储自动机的上下文数据
+type Context[T any] struct {
+	Data T
 }
 
-// Action 是状态转换时执行的回调函数
-type Action[S comparable, E comparable, C any] func(ctx C, from S, event E, to S) error
+// TransitionFunc 是状态转换函数的签名
+type TransitionFunc[T any] func(ctx *Context[T]) error
 
-// StateHook 是状态进入或退出时执行的回调函数
-type StateHook[S comparable, C any] func(ctx C, state S) error
+// ConditionFunc 是状态转换条件函数的签名
+type ConditionFunc[T any] func(ctx *Context[T]) bool
 
-// HistoryEntry 记录状态转换历史
-type HistoryEntry[S comparable, E comparable] struct {
-    From  S
-    Event E
-    To    S
+// StateChangeCallback 是状态变更回调函数的签名
+type StateChangeCallback[T any] func(oldState, newState State, event Event, ctx *Context[T])
+
+// Option 是状态机配置选项的函数类型
+type Option[T any] func(*StateMachine[T])
+
+// globalCallbacks 封装全局回调函数
+type globalCallbacks[T any] struct {
+	beforeEvent      TransitionFunc[T]
+	afterEvent       TransitionFunc[T]
+	beforeTransition TransitionFunc[T]
+	afterTransition  TransitionFunc[T]
 }
 
-// FSM 是泛型有限状态机的主结构体
-type FSM[S comparable, E comparable, C any] struct {
-    currentState S
-    transitions  map[S]map[E]S
-    actions      map[Transition[S, E]]Action[S, E, C]
-    enterHooks   map[S][]StateHook[S, C]
-    exitHooks    map[S][]StateHook[S, C]
-    history      *list.List // 状态转换历史
-    maxHistory   int        // 最大历史记录数
+// metrics 封装状态机指标
+type metrics struct {
+	eventTotal      *slog.Logger
+	transitionTotal *slog.Logger
 }
 
-// NewFSM 创建一个新的有限状态机实例
-func NewFSM[S comparable, E comparable, C any](initialState S) *FSM[S, E, C] {
-    return &FSM[S, E, C]{
-        currentState: initialState,
-        transitions:  make(map[S]map[E]S),
-        actions:      make(map[Transition[S, E]]Action[S, E, C]),
-        enterHooks:   make(map[S][]StateHook[S, C]),
-        exitHooks:    make(map[S][]StateHook[S, C]),
-        history:      list.New(),
-        maxHistory:   100, // 默认最大历史记录数
-    }
+// StateMachine 是有限状态自动机的主要结构体
+type StateMachine[T any] struct {
+	mu                    sync.RWMutex                          // 保护共享资源
+	currentState          State                                 // 当前状态
+	states                map[State]struct{}                    // 所有注册的状态
+	transitions           map[State]map[Event][]transition[T]   // 状态转换规则
+	callbacks             map[State]map[Event]TransitionFunc[T] // 事件回调
+	onEnterState          map[State]TransitionFunc[T]           // 进入状态回调
+	onExitState           map[State]TransitionFunc[T]           // 退出状态回调
+	ctx                   *Context[T]                           // 上下文数据
+	implicitStateCreation bool                                  // 是否隐式创建状态
+	globals               globalCallbacks[T]                    // 全局回调
+	onStateChange         []StateChangeCallback[T]              // 状态变更回调
+	logger                *slog.Logger                          // 日志记录器
+	// metrics               *metrics                              // 指标收集器
+	shutdownCallbacks []TransitionFunc[T] // 关闭回调
+	running           bool                // 是否正在运行
 }
 
-// SetMaxHistory 设置最大历史记录数
-func (f *FSM[S, E, C]) SetMaxHistory(max int) {
-    f.maxHistory = max
+// transition 表示一个状态转换规则
+type transition[T any] struct {
+	to        State
+	condition ConditionFunc[T]
+	callback  TransitionFunc[T]
 }
 
-// AddTransition 添加单个状态转换规则
-func (f *FSM[S, E, C]) AddTransition(from S, event E, to S) {
-    if _, ok := f.transitions[from]; !ok {
-        f.transitions[from] = make(map[E]S)
-    }
-    f.transitions[from][event] = to
+// 自定义错误类型
+var (
+	ErrStateNotFound       = errors.New("状态不存在")
+	ErrEventNoTransition   = errors.New("事件无匹配转换")
+	ErrStateMachineRunning = errors.New("状态机正在运行")
+)
+
+// WithImplicitStateCreation 启用隐式状态创建
+func WithImplicitStateCreation[T any](enabled bool) Option[T] {
+	return func(sm *StateMachine[T]) {
+		sm.implicitStateCreation = enabled
+	}
 }
 
-// AddTransitions 批量添加状态转换规则
-func (f *FSM[S, E, C]) AddTransitions(transitions ...Transition[S, E]) {
-    for _, t := range transitions {
-        f.AddTransition(t.From, t.Event, t.To)
-    }
+// WithLogger 设置日志记录器
+func WithLogger[T any](logger *slog.Logger) Option[T] {
+	return func(sm *StateMachine[T]) {
+		sm.logger = logger
+	}
 }
 
-// On 添加状态转换时执行的动作
-func (f *FSM[S, E, C]) On(from S, event E, to S, action Action[S, E, C]) {
-    transition := Transition[S, E]{From: from, Event: event, To: to}
-    f.actions[transition] = action
+// WithGlobalBeforeEvent 设置在任何事件处理前执行的全局回调
+func WithGlobalBeforeEvent[T any](callback TransitionFunc[T]) Option[T] {
+	return func(sm *StateMachine[T]) {
+		sm.globals.beforeEvent = callback
+	}
 }
 
-// OnEnter 添加状态进入时执行的钩子
-func (f *FSM[S, E, C]) OnEnter(state S, hook StateHook[S, C]) {
-    f.enterHooks[state] = append(f.enterHooks[state], hook)
+// WithGlobalAfterEvent 设置在任何事件处理后执行的全局回调
+func WithGlobalAfterEvent[T any](callback TransitionFunc[T]) Option[T] {
+	return func(sm *StateMachine[T]) {
+		sm.globals.afterEvent = callback
+	}
 }
 
-// OnExit 添加状态退出时执行的钩子
-func (f *FSM[S, E, C]) OnExit(state S, hook StateHook[S, C]) {
-    f.exitHooks[state] = append(f.exitHooks[state], hook)
+// WithGlobalBeforeTransition 设置在任何状态转换前执行的全局回调
+func WithGlobalBeforeTransition[T any](callback TransitionFunc[T]) Option[T] {
+	return func(sm *StateMachine[T]) {
+		sm.globals.beforeTransition = callback
+	}
 }
 
-// CurrentState 返回当前状态
-func (f *FSM[S, E, C]) CurrentState() S {
-    return f.currentState
+// WithGlobalAfterTransition 设置在任何状态转换后执行的全局回调
+func WithGlobalAfterTransition[T any](callback TransitionFunc[T]) Option[T] {
+	return func(sm *StateMachine[T]) {
+		sm.globals.afterTransition = callback
+	}
 }
 
-// Can 检查是否可以从当前状态通过特定事件转换
-func (f *FSM[S, E, C]) Can(event E) bool {
-    if transitions, ok := f.transitions[f.currentState]; ok {
-        _, ok := transitions[event]
-        return ok
-    }
-    return false
+// NewStateMachine 创建一个新的有限状态自动机实例
+func NewStateMachine[T any](initialState State, opts ...Option[T]) *StateMachine[T] {
+	// 使用标准日志作为默认日志记录器
+	logger := slog.Default()
+
+	sm := &StateMachine[T]{
+		currentState:          initialState,
+		states:                make(map[State]struct{}),
+		transitions:           make(map[State]map[Event][]transition[T]),
+		callbacks:             make(map[State]map[Event]TransitionFunc[T]),
+		onEnterState:          make(map[State]TransitionFunc[T]),
+		onExitState:           make(map[State]TransitionFunc[T]),
+		ctx:                   &Context[T]{},
+		implicitStateCreation: true, // 默认启用隐式创建
+		logger:                logger,
+	}
+
+	for _, opt := range opts {
+		opt(sm)
+	}
+
+	// 隐式添加初始状态
+	if sm.implicitStateCreation {
+		sm.states[initialState] = struct{}{}
+	}
+
+	sm.logger.Info("状态机初始化完成", "initial_state", initialState)
+	return sm
 }
 
-// Events 返回当前状态下可用的事件列表
-func (f *FSM[S, E, C]) Events() []E {
-    if transitions, ok := f.transitions[f.currentState]; ok {
-        events := make([]E, 0, len(transitions))
-        for event := range transitions {
-            events = append(events, event)
-        }
-        return events
-    }
-    return []E{}
+// AddState 添加一个新状态到自动机
+func (sm *StateMachine[T]) AddState(state State) *StateMachine[T] {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	sm.states[state] = struct{}{}
+	sm.logger.Info("添加新状态", "state", state)
+	return sm
 }
 
-// History 返回状态转换历史
-func (f *FSM[S, E, C]) History() []HistoryEntry[S, E] {
-    history := make([]HistoryEntry[S, E], 0, f.history.Len())
-    for e := f.history.Front(); e != nil; e = e.Next() {
-        history = append(history, e.Value.(HistoryEntry[S, E]))
-    }
-    return history
+// requireState 确保状态存在，如果不存在则根据配置决定是返回错误还是添加
+func (sm *StateMachine[T]) requireState(state State, operation string) error {
+	sm.mu.RLock()
+	_, exists := sm.states[state]
+	sm.mu.RUnlock()
+
+	if !exists {
+		if sm.implicitStateCreation {
+			sm.mu.Lock()
+			sm.states[state] = struct{}{}
+			sm.mu.Unlock()
+			sm.logger.Info("隐式创建状态", "state", state, "operation", operation)
+			return nil
+		}
+		return fmt.Errorf("%w: %s: 状态 %s 不存在", ErrStateNotFound, operation, state)
+	}
+	return nil
 }
 
-// Transition 执行状态转换
-func (f *FSM[S, E, C]) Transition(ctx C, event E) error {
-    if !f.Can(event) {
-        return fmt.Errorf("transition from state %v on event %v is not allowed", f.currentState, event)
-    }
+// AddTransition 添加一个状态转换规则
+func (sm *StateMachine[T]) AddTransition(from, to State, event Event, condition ConditionFunc[T]) (*StateMachine[T], error) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 
-    to := f.transitions[f.currentState][event]
-    transition := Transition[S, E]{From: f.currentState, Event: event, To: to}
+	if err := sm.requireState(from, "添加转换"); err != nil {
+		return nil, err
+	}
+	if err := sm.requireState(to, "添加转换"); err != nil {
+		return nil, err
+	}
 
-    // 执行退出当前状态的钩子
-    if hooks, ok := f.exitHooks[f.currentState]; ok {
-        for _, hook := range hooks {
-            if err := hook(ctx, f.currentState); err != nil {
-                return fmt.Errorf("exit hook failed for state %v: %w", f.currentState, err)
-            }
-        }
-    }
+	// 初始化事件转换映射
+	if _, exists := sm.transitions[from]; !exists {
+		sm.transitions[from] = make(map[Event][]transition[T])
+	}
 
-    // 执行状态转换前的动作
-    if action, ok := f.actions[transition]; ok {
-        if err := action(ctx, f.currentState, event, to); err != nil {
-            return fmt.Errorf("action failed during transition from %v to %v on event %v: %w",
-                f.currentState, to, event, err)
-        }
-    }
+	sm.transitions[from][event] = append(sm.transitions[from][event], transition[T]{
+		to:        to,
+		condition: condition,
+	})
 
-    // 记录历史
-    f.history.PushBack(HistoryEntry[S, E]{
-        From:  f.currentState,
-        Event: event,
-        To:    to,
-    })
+	sm.logger.Info("添加状态转换", "from", from, "to", to, "event", event)
+	return sm, nil
+}
 
-    // 限制历史记录数量
-    if f.history.Len() > f.maxHistory {
-        f.history.Remove(f.history.Front())
-    }
+// AddTransitionWithCallback 添加一个带回调的状态转换规则
+func (sm *StateMachine[T]) AddTransitionWithCallback(from, to State, event Event, condition ConditionFunc[T], callback TransitionFunc[T]) (*StateMachine[T], error) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 
-    // 执行进入新状态的钩子
-    if hooks, ok := f.enterHooks[to]; ok {
-        for _, hook := range hooks {
-            if err := hook(ctx, to); err != nil {
-                return fmt.Errorf("enter hook failed for state %v: %w", to, err)
-            }
-        }
-    }
+	if err := sm.requireState(from, "添加带回调转换"); err != nil {
+		return nil, err
+	}
+	if err := sm.requireState(to, "添加带回调转换"); err != nil {
+		return nil, err
+	}
 
-    // 更新当前状态
-    f.currentState = to
-    return nil
-}    
+	// 初始化事件转换映射
+	if _, exists := sm.transitions[from]; !exists {
+		sm.transitions[from] = make(map[Event][]transition[T])
+	}
+
+	sm.transitions[from][event] = append(sm.transitions[from][event], transition[T]{
+		to:        to,
+		condition: condition,
+		callback:  callback,
+	})
+
+	sm.logger.Info("添加带回调状态转换", "from", from, "to", to, "event", event)
+	return sm, nil
+}
+
+// AddSimpleTransition 添加无条件的状态转换规则
+func (sm *StateMachine[T]) AddSimpleTransition(from, to State, event Event) (*StateMachine[T], error) {
+	return sm.AddTransition(from, to, event, nil)
+}
+
+// AddSimpleTransitionWithCallback 添加无条件且带回调的状态转换规则
+func (sm *StateMachine[T]) AddSimpleTransitionWithCallback(from, to State, event Event, callback TransitionFunc[T]) (*StateMachine[T], error) {
+	return sm.AddTransitionWithCallback(from, to, event, nil, callback)
+}
+
+// OnEvent 注册一个事件回调函数
+func (sm *StateMachine[T]) OnEvent(state State, event Event, callback TransitionFunc[T]) (*StateMachine[T], error) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	if err := sm.requireState(state, "注册事件回调"); err != nil {
+		return nil, err
+	}
+
+	// 初始化事件回调映射
+	if _, exists := sm.callbacks[state]; !exists {
+		sm.callbacks[state] = make(map[Event]TransitionFunc[T])
+	}
+
+	sm.callbacks[state][event] = callback
+	sm.logger.Info("注册事件回调", "state", state, "event", event)
+	return sm, nil
+}
+
+// OnEnterState 注册一个状态进入回调函数
+func (sm *StateMachine[T]) OnEnterState(state State, callback TransitionFunc[T]) (*StateMachine[T], error) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	if err := sm.requireState(state, "注册进入状态回调"); err != nil {
+		return nil, err
+	}
+
+	sm.onEnterState[state] = callback
+	sm.logger.Info("注册进入状态回调", "state", state)
+	return sm, nil
+}
+
+// OnExitState 注册一个状态退出回调函数
+func (sm *StateMachine[T]) OnExitState(state State, callback TransitionFunc[T]) (*StateMachine[T], error) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	if err := sm.requireState(state, "注册退出状态回调"); err != nil {
+		return nil, err
+	}
+
+	sm.onExitState[state] = callback
+	sm.logger.Info("注册退出状态回调", "state", state)
+	return sm, nil
+}
+
+// OnStateChange 注册状态变更回调
+func (sm *StateMachine[T]) OnStateChange(callback StateChangeCallback[T]) *StateMachine[T] {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	sm.onStateChange = append(sm.onStateChange, callback)
+	sm.logger.Info("注册状态变更回调")
+	return sm
+}
+
+// BeforeAnyEvent 注册一个在所有事件处理前执行的全局回调
+func (sm *StateMachine[T]) BeforeAnyEvent(callback TransitionFunc[T]) *StateMachine[T] {
+	sm.globals.beforeEvent = callback
+	return sm
+}
+
+// AfterAnyEvent 注册一个在所有事件处理后执行的全局回调
+func (sm *StateMachine[T]) AfterAnyEvent(callback TransitionFunc[T]) *StateMachine[T] {
+	sm.globals.afterEvent = callback
+	return sm
+}
+
+// BeforeAnyTransition 注册一个在所有状态转换前执行的全局回调
+func (sm *StateMachine[T]) BeforeAnyTransition(callback TransitionFunc[T]) *StateMachine[T] {
+	sm.globals.beforeTransition = callback
+	return sm
+}
+
+// AfterAnyTransition 注册一个在所有状态转换后执行的全局回调
+func (sm *StateMachine[T]) AfterAnyTransition(callback TransitionFunc[T]) *StateMachine[T] {
+	sm.globals.afterTransition = callback
+	return sm
+}
+
+// OnShutdown 注册一个在状态机停止时执行的回调
+func (sm *StateMachine[T]) OnShutdown(callback TransitionFunc[T]) *StateMachine[T] {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	sm.shutdownCallbacks = append(sm.shutdownCallbacks, callback)
+	sm.logger.Info("注册关闭回调")
+	return sm
+}
+
+// SetContext 设置自动机的上下文数据
+func (sm *StateMachine[T]) SetContext(data T) *StateMachine[T] {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	sm.ctx.Data = data
+	sm.logger.Info("设置上下文数据")
+	return sm
+}
+
+// GetContext 获取自动机的上下文数据
+func (sm *StateMachine[T]) GetContext() *Context[T] {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	return sm.ctx
+}
+
+// CurrentState 返回自动机的当前状态
+func (sm *StateMachine[T]) CurrentState() State {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	return sm.currentState
+}
+
+// IsRunning 返回状态机是否正在运行
+func (sm *StateMachine[T]) IsRunning() bool {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	return sm.running
+}
+
+// SendEvent 向自动机发送一个事件，触发状态转换
+func (sm *StateMachine[T]) SendEvent(event Event) error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	// 确保 afterAnyEvent 始终执行
+	defer func() {
+		if sm.globals.afterEvent != nil {
+			if err := sm.globals.afterEvent(sm.ctx); err != nil {
+				sm.logger.Warn("全局事件后回调出错", "error", err)
+			}
+		}
+	}()
+
+	sm.logger.Info("收到事件", "event", event, "current_state", sm.currentState)
+
+	// 执行全局事件前回调
+	if sm.globals.beforeEvent != nil {
+		if err := sm.globals.beforeEvent(sm.ctx); err != nil {
+			return fmt.Errorf("全局事件前回调出错: %w", err)
+		}
+	}
+
+	// 查找匹配的转换规则
+	transition, err := sm.findMatchingTransition(event)
+	if err != nil {
+		return err
+	}
+
+	// 执行状态转换
+	if err := sm.executeTransition(transition, event); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// findMatchingTransition 查找匹配的转换规则
+func (sm *StateMachine[T]) findMatchingTransition(event Event) (*transition[T], error) {
+	currentTransitions, exists := sm.transitions[sm.currentState]
+	if !exists {
+		return nil, fmt.Errorf("%w: 状态 %s 无事件 %s 的转换", ErrEventNoTransition, sm.currentState, event)
+	}
+
+	// 查找匹配的转换规则
+	transitions, ok := currentTransitions[event]
+	if !ok {
+		return nil, fmt.Errorf("%w: 状态 %s 无事件 %s 的转换", ErrEventNoTransition, sm.currentState, event)
+	}
+
+	// 查找第一个满足条件的转换
+	var matchedTransition *transition[T]
+	for _, t := range transitions {
+		if t.condition == nil || t.condition(sm.ctx) {
+			matchedTransition = &t
+			break
+		}
+	}
+
+	if matchedTransition == nil {
+		return nil, fmt.Errorf("状态 %s 没有满足条件的事件 %s 的转换", sm.currentState, event)
+	}
+
+	return matchedTransition, nil
+}
+
+// executeTransition 执行状态转换
+func (sm *StateMachine[T]) executeTransition(t *transition[T], event Event) error {
+	oldState := sm.currentState
+	sm.logger.Info("开始状态转换", "from", oldState, "to", t.to, "event", event)
+
+	// 执行全局转换前回调
+	if sm.globals.beforeTransition != nil {
+		if err := sm.globals.beforeTransition(sm.ctx); err != nil {
+			return fmt.Errorf("全局转换前回调出错: %w", err)
+		}
+	}
+
+	// 执行事件回调（优先使用转换中定义的回调）
+	var eventCallback TransitionFunc[T]
+	if t.callback != nil {
+		eventCallback = t.callback
+	} else if ec, exists := sm.callbacks[oldState][event]; exists {
+		eventCallback = ec
+	}
+
+	if eventCallback != nil {
+		if err := eventCallback(sm.ctx); err != nil {
+			return fmt.Errorf("处理事件 %s 时出错: %w", event, err)
+		}
+	}
+
+	// 执行状态退出回调
+	if exitCallback, exists := sm.onExitState[oldState]; exists {
+		if err := exitCallback(sm.ctx); err != nil {
+			return fmt.Errorf("退出状态 %s 时出错: %w", oldState, err)
+		}
+	}
+
+	// 执行状态进入回调
+	if enterCallback, exists := sm.onEnterState[t.to]; exists {
+		if err := enterCallback(sm.ctx); err != nil {
+			return fmt.Errorf("进入状态 %s 时出错: %w", t.to, err)
+		}
+	}
+
+	// 转换到新状态
+	sm.currentState = t.to
+
+	// 执行全局转换后回调
+	if sm.globals.afterTransition != nil {
+		if err := sm.globals.afterTransition(sm.ctx); err != nil {
+			return fmt.Errorf("全局转换后回调出错: %w", err)
+		}
+	}
+
+	// 触发所有状态变更回调
+	for _, cb := range sm.onStateChange {
+		cb(oldState, t.to, event, sm.ctx)
+	}
+
+	sm.logger.Info("状态转换完成", "from", oldState, "to", sm.currentState, "event", event)
+	return nil
+}
+
+// StartAutoRun 启动自动运行模式，持续发送事件直到满足退出条件
+func (sm *StateMachine[T]) StartAutoRun(eventGenerator func() (Event, bool)) error {
+	sm.mu.Lock()
+	if sm.running {
+		sm.mu.Unlock()
+		return ErrStateMachineRunning
+	}
+	sm.running = true
+	sm.mu.Unlock()
+
+	defer func() {
+		sm.mu.Lock()
+		sm.running = false
+		sm.mu.Unlock()
+
+		// 执行所有关闭回调
+		for _, callback := range sm.shutdownCallbacks {
+			if err := callback(sm.ctx); err != nil {
+				sm.logger.Warn("关闭回调出错", "error", err)
+			}
+		}
+		sm.logger.Info("状态机已停止")
+	}()
+
+	sm.logger.Info("状态机自动运行模式已启动")
+
+	for {
+		// 生成下一个事件
+		event, continueRunning := eventGenerator()
+		if !continueRunning {
+			break
+		}
+
+		// 发送事件
+		if err := sm.SendEvent(event); err != nil {
+			sm.logger.Error("自动运行时处理事件出错", "event", event, "error", err)
+			return err
+		}
+	}
+
+	return nil
+}
+
+// Validate 验证自动机的配置是否有效
+func (sm *StateMachine[T]) Validate() error {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	// 检查初始状态是否存在
+	if _, exists := sm.states[sm.currentState]; !exists {
+		return fmt.Errorf("初始状态 %s 不存在", sm.currentState)
+	}
+
+	// 检查所有转换的目标状态是否存在
+	for fromState, events := range sm.transitions {
+		for event, transitions := range events {
+			for _, t := range transitions {
+				if _, exists := sm.states[t.to]; !exists {
+					return fmt.Errorf("状态 %s 的事件 %s 转换到不存在的状态 %s", fromState, event, t.to)
+				}
+			}
+		}
+	}
+
+	// 检查所有回调的状态是否存在
+	for state := range sm.callbacks {
+		if _, exists := sm.states[state]; !exists {
+			return fmt.Errorf("回调注册到不存在的状态 %s", state)
+		}
+	}
+
+	// 检查所有进入状态回调的状态是否存在
+	for state := range sm.onEnterState {
+		if _, exists := sm.states[state]; !exists {
+			return fmt.Errorf("进入状态回调注册到不存在的状态 %s", state)
+		}
+	}
+
+	// 检查所有退出状态回调的状态是否存在
+	for state := range sm.onExitState {
+		if _, exists := sm.states[state]; !exists {
+			return fmt.Errorf("退出状态回调注册到不存在的状态 %s", state)
+		}
+	}
+
+	return nil
+}
+
+// MustValidate 验证自动机配置，如果无效则panic
+func (sm *StateMachine[T]) MustValidate() {
+	if err := sm.Validate(); err != nil {
+		panic(fmt.Sprintf("自动机配置无效: %v", err))
+	}
+}
