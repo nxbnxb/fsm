@@ -22,6 +22,9 @@ type Context[T any] struct {
 // TransitionFunc 是状态转换函数的签名
 type TransitionFunc[T any] func(ctx *Context[T]) error
 
+// TransitionEventFunc 是状态转换函数的签名
+type TransitionEventFunc[T any] func(event Event, ctx *Context[T]) error
+
 // ConditionFunc 是状态转换条件函数的签名
 type ConditionFunc[T any] func(ctx *Context[T]) bool
 
@@ -33,8 +36,8 @@ type Option[T any] func(*StateMachine[T])
 
 // globalCallbacks 封装全局回调函数
 type globalCallbacks[T any] struct {
-	beforeEvent      TransitionFunc[T]
-	afterEvent       TransitionFunc[T]
+	beforeEvent      TransitionEventFunc[T]
+	afterEvent       TransitionEventFunc[T]
 	beforeTransition TransitionFunc[T]
 	afterTransition  TransitionFunc[T]
 }
@@ -93,14 +96,14 @@ func WithLogger[T any](logger *slog.Logger) Option[T] {
 }
 
 // WithGlobalBeforeEvent 设置在任何事件处理前执行的全局回调
-func WithGlobalBeforeEvent[T any](callback TransitionFunc[T]) Option[T] {
+func WithGlobalBeforeEvent[T any](callback TransitionEventFunc[T]) Option[T] {
 	return func(sm *StateMachine[T]) {
 		sm.globals.beforeEvent = callback
 	}
 }
 
 // WithGlobalAfterEvent 设置在任何事件处理后执行的全局回调
-func WithGlobalAfterEvent[T any](callback TransitionFunc[T]) Option[T] {
+func WithGlobalAfterEvent[T any](callback TransitionEventFunc[T]) Option[T] {
 	return func(sm *StateMachine[T]) {
 		sm.globals.afterEvent = callback
 	}
@@ -301,13 +304,13 @@ func (sm *StateMachine[T]) OnStateChange(callback StateChangeCallback[T]) *State
 }
 
 // BeforeAnyEvent 注册一个在所有事件处理前执行的全局回调
-func (sm *StateMachine[T]) BeforeAnyEvent(callback TransitionFunc[T]) *StateMachine[T] {
+func (sm *StateMachine[T]) BeforeAnyEvent(callback TransitionEventFunc[T]) *StateMachine[T] {
 	sm.globals.beforeEvent = callback
 	return sm
 }
 
 // AfterAnyEvent 注册一个在所有事件处理后执行的全局回调
-func (sm *StateMachine[T]) AfterAnyEvent(callback TransitionFunc[T]) *StateMachine[T] {
+func (sm *StateMachine[T]) AfterAnyEvent(callback TransitionEventFunc[T]) *StateMachine[T] {
 	sm.globals.afterEvent = callback
 	return sm
 }
@@ -376,7 +379,7 @@ func (sm *StateMachine[T]) SendEvent(event Event) error {
 	// 确保 afterAnyEvent 始终执行
 	defer func() {
 		if sm.globals.afterEvent != nil {
-			if err := sm.globals.afterEvent(sm.ctx); err != nil {
+			if err := sm.globals.afterEvent(event, sm.ctx); err != nil {
 				sm.logger.Warn("全局事件后回调出错", "error", err)
 			}
 		}
@@ -386,7 +389,7 @@ func (sm *StateMachine[T]) SendEvent(event Event) error {
 
 	// 执行全局事件前回调
 	if sm.globals.beforeEvent != nil {
-		if err := sm.globals.beforeEvent(sm.ctx); err != nil {
+		if err := sm.globals.beforeEvent(event, sm.ctx); err != nil {
 			return fmt.Errorf("全局事件前回调出错: %w", err)
 		}
 	}
@@ -493,49 +496,6 @@ func (sm *StateMachine[T]) executeTransition(t *transition[T], event Event) erro
 	return nil
 }
 
-// StartAutoRun 启动自动运行模式，持续发送事件直到满足退出条件
-func (sm *StateMachine[T]) StartAutoRun(eventGenerator func() (Event, bool)) error {
-	sm.mu.Lock()
-	if sm.running {
-		sm.mu.Unlock()
-		return ErrStateMachineRunning
-	}
-	sm.running = true
-	sm.mu.Unlock()
-
-	defer func() {
-		sm.mu.Lock()
-		sm.running = false
-		sm.mu.Unlock()
-
-		// 执行所有关闭回调
-		for _, callback := range sm.shutdownCallbacks {
-			if err := callback(sm.ctx); err != nil {
-				sm.logger.Warn("关闭回调出错", "error", err)
-			}
-		}
-		sm.logger.Info("状态机已停止")
-	}()
-
-	sm.logger.Info("状态机自动运行模式已启动")
-
-	for {
-		// 生成下一个事件
-		event, continueRunning := eventGenerator()
-		if !continueRunning {
-			break
-		}
-
-		// 发送事件
-		if err := sm.SendEvent(event); err != nil {
-			sm.logger.Error("自动运行时处理事件出错", "event", event, "error", err)
-			return err
-		}
-	}
-
-	return nil
-}
-
 // Validate 验证自动机的配置是否有效
 func (sm *StateMachine[T]) Validate() error {
 	sm.mu.RLock()
@@ -582,8 +542,100 @@ func (sm *StateMachine[T]) Validate() error {
 }
 
 // MustValidate 验证自动机配置，如果无效则panic
-func (sm *StateMachine[T]) MustValidate() {
+func (sm *StateMachine[T]) MustValidate() error {
 	if err := sm.Validate(); err != nil {
-		panic(fmt.Sprintf("自动机配置无效: %v", err))
+		return fmt.Errorf("自动机配置无效: %v", err)
 	}
+	return nil
+}
+
+// EventGenerator 是事件生成器函数的签名
+type EventGenerator[T any] func() (Event, bool)
+
+// StartAutoRun 启动自动运行模式，持续发送事件直到满足退出条件
+func (sm *StateMachine[T]) StartAutoRun(generator EventGenerator[T]) *StateMachine[T] {
+	sm.mu.Lock()
+	if sm.running {
+		sm.ctx.Error = ErrStateMachineRunning
+		sm.mu.Unlock()
+		return sm
+	}
+	sm.running = true
+	sm.mu.Unlock()
+
+	for {
+		event, ok := generator()
+		if !ok {
+			break
+		}
+
+		if err := sm.processEvent(event); err != nil {
+			sm.ctx.Error = err
+			break
+		}
+	}
+
+	sm.mu.Lock()
+	sm.running = false
+	sm.mu.Unlock()
+	return sm
+}
+
+// processEvent 处理单个事件
+func (sm *StateMachine[T]) processEvent(event Event) error {
+	sm.mu.RLock()
+	currentState := sm.currentState
+	transitions, ok := sm.transitions[currentState][event]
+	sm.mu.RUnlock()
+
+	if !ok {
+		return ErrEventNoTransition
+	}
+
+	for _, trans := range transitions {
+		if trans.condition == nil || trans.condition(sm.ctx) {
+			sm.mu.Lock()
+			oldState := sm.currentState
+			sm.currentState = trans.to
+			sm.mu.Unlock()
+
+			if sm.globals.beforeTransition != nil {
+				if err := sm.globals.beforeTransition(sm.ctx); err != nil {
+					return err
+				}
+			}
+
+			if exitCallback, ok := sm.onExitState[oldState]; ok {
+				if err := exitCallback(sm.ctx); err != nil {
+					return err
+				}
+			}
+
+			if enterCallback, ok := sm.onEnterState[sm.currentState]; ok {
+				if err := enterCallback(sm.ctx); err != nil {
+					return err
+				}
+			}
+
+			if trans.callback != nil {
+				if err := trans.callback(sm.ctx); err != nil {
+					return err
+				}
+			}
+
+			if sm.globals.afterTransition != nil {
+				if err := sm.globals.afterTransition(sm.ctx); err != nil {
+					return err
+				}
+			}
+
+			for _, callback := range sm.onStateChange {
+				callback(oldState, sm.currentState, event, sm.ctx)
+			}
+
+			return nil
+		}
+	}
+
+	return ErrEventNoTransition
 }
